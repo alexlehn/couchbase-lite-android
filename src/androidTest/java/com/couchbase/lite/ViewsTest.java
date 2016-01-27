@@ -19,6 +19,7 @@ package com.couchbase.lite;
 
 import com.couchbase.lite.View.TDViewCollation;
 import com.couchbase.lite.internal.RevisionInternal;
+import com.couchbase.lite.mockserver.MockHelper;
 import com.couchbase.lite.store.Store;
 import com.couchbase.lite.store.StoreDelegate;
 import com.couchbase.lite.util.Log;
@@ -958,12 +959,12 @@ public class ViewsTest extends LiteTestCaseWithDB {
         Assert.assertEquals(3, dumpResult.size());
         Assert.assertEquals("\"App\"", dumpResult.get(0).get("key"));
         Assert.assertEquals(1.95, dumpResult.get(0).get("value") instanceof String ? Double.parseDouble((String)dumpResult.get(0).get("value")) : dumpResult.get(0).get("value"));
-        Assert.assertEquals(2, ((Number)dumpResult.get(0).get("seq")).intValue());
+        Assert.assertEquals(2, ((Number) dumpResult.get(0).get("seq")).intValue());
         Assert.assertEquals("\"CD\"", dumpResult.get(1).get("key"));
-        Assert.assertEquals(8.99, dumpResult.get(1).get("value") instanceof String ? Double.parseDouble((String)dumpResult.get(1).get("value")) : dumpResult.get(1).get("value"));
-        Assert.assertEquals(1, ((Number)dumpResult.get(1).get("seq")).intValue());
+        Assert.assertEquals(8.99, dumpResult.get(1).get("value") instanceof String ? Double.parseDouble((String) dumpResult.get(1).get("value")) : dumpResult.get(1).get("value"));
+        Assert.assertEquals(1, ((Number) dumpResult.get(1).get("seq")).intValue());
         Assert.assertEquals("\"Dessert\"", dumpResult.get(2).get("key"));
-        Assert.assertEquals(6.5, dumpResult.get(2).get("value") instanceof String ? Double.parseDouble((String)dumpResult.get(2).get("value")) : dumpResult.get(2).get("value"));
+        Assert.assertEquals(6.5, dumpResult.get(2).get("value") instanceof String ? Double.parseDouble((String) dumpResult.get(2).get("value")) : dumpResult.get(2).get("value"));
         Assert.assertEquals(3, ((Number)dumpResult.get(2).get("seq")).intValue());
 
         QueryOptions options = new QueryOptions();
@@ -2612,6 +2613,33 @@ public class ViewsTest extends LiteTestCaseWithDB {
     }
 
     /**
+     * Helper Method to simplify hooking out StoreDelegate rev id generation
+     */
+    private static StoreDelegate storeDelegateWithPredefinedRevID(final String revID) {
+        return new StoreDelegate() {
+            @Override
+            public void storageExitedTransaction(boolean committed) {
+
+            }
+
+            @Override
+            public void databaseStorageChanged(DocumentChange change) {
+
+            }
+
+            @Override
+            public String generateRevID(byte[] json, boolean deleted, String prevRevID) {
+                return revID;
+            }
+
+            @Override
+            public boolean runFilter(ReplicationFilter filter, Map<String, Object> filterParams, RevisionInternal rev) {
+                return false;
+            }
+        };
+    }
+
+    /**
      * Views broken with concurrent update and delete
      * https://github.com/couchbase/couchbase-lite-java-core/issues/952
      */
@@ -2656,23 +2684,9 @@ public class ViewsTest extends LiteTestCaseWithDB {
         StoreDelegate delegate = store.getDelegate();
 
         // set Revision ID "3-cccc"
-        store.setDelegate(new StoreDelegate() {
-            @Override
-            public void storageExitedTransaction(boolean committed) {
-            }
-            @Override
-            public void databaseStorageChanged(DocumentChange change) {
-            }
-            @Override
-            public String generateRevID(byte[] json, boolean deleted, String prevRevID) {
-                return "3-cccc";// 3-c is not appropriate revision id for forestdb
-            }
-            @Override
-            public boolean runFilter(ReplicationFilter filter, Map<String, Object> filterParams, RevisionInternal rev) {
-                return false;
-            }
-        });
-        // create rev3c from rev2a
+        store.setDelegate(storeDelegateWithPredefinedRevID("3-cccc"));// 3-c is not appropriate revision id for forestdb)
+
+        // create rev3c from rev2a with delete
         props.put("_rev", leaf1.getRevID());
         props.put("key", "3-c");
         RevisionInternal rev3c = new RevisionInternal(props);
@@ -2680,23 +2694,9 @@ public class ViewsTest extends LiteTestCaseWithDB {
         Log.e(TAG, String.format("leaf3c: seq=%d, doc_id=%s, rev_id=%s deleted=%s", leaf3c.getSequence(), leaf3c.getDocID(), leaf3c.getRevID(), leaf3c.isDeleted() ? "true" : "false"));
 
         // set Revision ID "3-dddd"
-        store.setDelegate(new StoreDelegate() {
-            @Override
-            public void storageExitedTransaction(boolean committed) {
-            }
-            @Override
-            public void databaseStorageChanged(DocumentChange change) {
-            }
-            @Override
-            public String generateRevID(byte[] json, boolean deleted, String prevRevID) {
-                return "3-dddd"; // 3-d is not appropriate revision id for forestdb
-            }
-            @Override
-            public boolean runFilter(ReplicationFilter filter, Map<String, Object> filterParams, RevisionInternal rev) {
-                return false;
-            }
-        });
-        // create rev3d from rev2b with delete
+        store.setDelegate(storeDelegateWithPredefinedRevID("3-dddd")); // 3-d is not appropriate revision id for forestdb
+
+        // create rev3d from rev2b
         RevisionInternal leaf3d = new RevisionInternal("doc1", null, true);
         leaf3d = database.putRevision(leaf3d, leaf2b.getRevID(), true);
         Log.e(TAG, String.format("leaf3d: seq=%d, doc_id=%s, rev_id=%s deleted=%s", leaf3d.getSequence(), leaf3d.getDocID(), leaf3d.getRevID(), leaf3d.isDeleted() ? "true" : "false"));
@@ -2708,6 +2708,89 @@ public class ViewsTest extends LiteTestCaseWithDB {
         // update index
         view.updateIndex();
         List<QueryRow>rows = view.query(null);
+        assertNotNull(rows);
+        Log.e(TAG, rows.toString());
+        assertEquals(1, rows.size());
+        assertEquals("3-c", rows.get(0).getKey());
+    }
+
+    /**
+     * Views broken with concurrent update and delete
+     * https://github.com/couchbase/couchbase-lite-java-core/issues/952
+     */
+    public void testViewUpdateWinningRevisionIsNotIndexedRegression() throws CouchbaseLiteException {
+        //
+        // revid 3-c should be indexed with folloiwng condition.
+        // NOTE: As 3-d > 3-c (deleted), So this might cause indexing problem
+        //
+        // seq  | doc_id | revid | parent | current | deleted
+        // -----+--------+-------+--------+---------+--------
+        // 1    | doc1   | 1-x   | NULL   | 0       | 0
+        // 2    | doc1   | 2-a   | 1      | 0       | 0
+        // 3    | doc1   | 2-b   | 1      | 0       | 0
+        // 4    | doc1   | 3-d   | 2 (2-a)| 1       | 1
+        // 5    | doc1   | 3-c   | 3 (2-b)| 1       | 0
+
+        // create view
+        View view = createView(database);
+
+        // crete doc
+        Map<String, Object> props = new HashMap<String, Object>();
+        props.put("_id", "doc1");
+        props.put("key", "1-x");
+        RevisionInternal rev1 = new RevisionInternal(props);
+        RevisionInternal leaf1 = database.putRevision(rev1, null, false);
+        Log.e(TAG, String.format("leaf1: seq=%d, doc_id=%s, rev_id=%s deleted=%s", leaf1.getSequence(), leaf1.getDocID(), leaf1.getRevID(), leaf1.isDeleted() ? "true" : "false"));
+
+        // create conflicts rev2a and rev2b
+        props.put("_rev", leaf1.getRevID());
+        props.put("key", "2-a");
+        RevisionInternal rev2a = new RevisionInternal(props);
+        RevisionInternal leaf2a = database.putRevision(rev2a, leaf1.getRevID(), true);
+        Log.e(TAG, String.format("leaf2a: seq=%d, doc_id=%s, rev_id=%s deleted=%s", leaf2a.getSequence(), leaf2a.getDocID(), leaf2a.getRevID(), leaf2a.isDeleted() ? "true" : "false"));
+
+        props.put("key", "2-b");
+        RevisionInternal rev2b = new RevisionInternal(props);
+        RevisionInternal leaf2b = database.putRevision(rev2b, leaf1.getRevID(), true);
+        Log.e(TAG, String.format("leaf2b: seq=%d, doc_id=%s, rev_id=%s deleted=%s", leaf2b.getSequence(), leaf2b.getDocID(), leaf2b.getRevID(), leaf2b.isDeleted() ? "true" : "false"));
+
+        // Need to override StoreDelegate to control revision ID for generation 2-.
+        Store store = database.getStore();
+        StoreDelegate delegate = store.getDelegate();
+
+        // update index
+        view.updateIndex();
+        List<QueryRow>rows = view.query(null);
+        assertNotNull(rows);
+        Log.e(TAG, rows.toString());
+        assertEquals(1, rows.size());
+
+        // set Revision ID "3-dddd"
+        store.setDelegate(storeDelegateWithPredefinedRevID("3-dddd")); // 3-d is not appropriate revision id for forestdb
+
+        // create rev3d from rev2b
+        RevisionInternal leaf3d = new RevisionInternal("doc1", null, true);
+        leaf3d = database.putRevision(leaf3d, leaf2a.getRevID(), true);
+        Log.e(TAG, String.format("leaf3d: seq=%d, doc_id=%s, rev_id=%s deleted=%s", leaf3d.getSequence(), leaf3d.getDocID(), leaf3d.getRevID(), leaf3d.isDeleted() ? "true" : "false"));
+        assertTrue(leaf3d.isDeleted());
+
+        // set Revision ID "3-cccc"
+        store.setDelegate(storeDelegateWithPredefinedRevID("3-cccc"));// 3-c is not appropriate revision id for forestdb
+
+        // create rev3c from rev2a with delete
+        props.put("_rev", leaf1.getRevID());
+        props.put("key", "3-c");
+        RevisionInternal rev3c = new RevisionInternal(props);
+        RevisionInternal leaf3c = database.putRevision(rev3c, leaf2b.getRevID(), true);
+        Log.e(TAG, String.format("leaf3c: seq=%d, doc_id=%s, rev_id=%s deleted=%s", leaf3c.getSequence(), leaf3c.getDocID(), leaf3c.getRevID(), leaf3c.isDeleted() ? "true" : "false"));
+        assertFalse(leaf3c.isDeleted());
+
+        // make sure 3-d is higher revision than 3-c
+        assertTrue(leaf3d.getRevID().compareTo(leaf3c.getRevID()) > 0);
+
+        // update index and assume we get back rev 3-ccc
+        view.updateIndex();
+        rows = view.query(null);
         assertNotNull(rows);
         Log.e(TAG, rows.toString());
         assertEquals(1, rows.size());
